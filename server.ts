@@ -265,7 +265,8 @@ app.post('/api/auth/change-password', requireAuth as any, async (req: AuthReques
    ========================================================================== */
 
 // 1. OAuth Initiate - now requires auth, stores user_id in state
-app.get('/api/oauth/url', requireAuth as any, (req: AuthRequest, res) => {
+// Support both /api/auth/url (legacy) and /api/oauth/url (new)
+app.get(['/api/auth/url', '/api/oauth/url'], requireAuth as any, (req: AuthRequest, res) => {
   const redirectUri = getRedirectUri(req);
   const scopes = [
     'https://www.googleapis.com/auth/gmail.send',
