@@ -26,18 +26,24 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || 'GOCSPX-Z26C5ld
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// CORS - must be the VERY FIRST middleware, before everything else
-app.use((req, res, next) => {
-  // Always set CORS headers on every response
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS,PATCH');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Max-Age', '86400');
+// CORS
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || '*')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
 
-  // Handle preflight OPTIONS immediately - return before ANY other middleware
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (CORS_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && CORS_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') {
-    return res.status(204).end();
+    return res.sendStatus(204);
   }
   next();
 });
@@ -45,7 +51,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Apply IP restriction check globally (after CORS/OPTIONS handling)
+// Apply IP restriction check globally
 app.use(checkIpRestriction as any);
 
 // Get exact redirect URI dynamically
@@ -259,8 +265,7 @@ app.post('/api/auth/change-password', requireAuth as any, async (req: AuthReques
    ========================================================================== */
 
 // 1. OAuth Initiate - now requires auth, stores user_id in state
-// Support both /api/auth/url (legacy) and /api/oauth/url (new)
-app.get(['/api/auth/url', '/api/oauth/url'], requireAuth as any, (req: AuthRequest, res) => {
+app.get('/api/oauth/url', requireAuth as any, (req: AuthRequest, res) => {
   const redirectUri = getRedirectUri(req);
   const scopes = [
     'https://www.googleapis.com/auth/gmail.send',
