@@ -67,7 +67,7 @@ const getRedirectUri = (req: any) => {
 };
 
 // Custom helper: RFC 2822 email encoder
-const constructRawEmail = (to: string, fromName: string, fromEmail: string, subject: string, body: string) => {
+const constructRawEmail = (to: string, fromName: string, fromEmail: string, subject: string, body: string, replyTo?: string) => {
   const fromHeader = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
   const emailLines = [
     `From: ${fromHeader}`,
@@ -76,9 +76,11 @@ const constructRawEmail = (to: string, fromName: string, fromEmail: string, subj
     'MIME-Version: 1.0',
     'Content-Type: text/html; charset=utf-8',
     'Content-Transfer-Encoding: 7bit',
-    '',
-    body
   ];
+  if (replyTo) {
+    emailLines.splice(2, 0, `Reply-To: <${replyTo}>`);
+  }
+  emailLines.push('', body);
   const rawEmail = emailLines.join('\r\n');
   return Buffer.from(rawEmail)
     .toString('base64')
@@ -541,7 +543,8 @@ app.get('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => {
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt"
+       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
+       reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.user!.id]
     );
@@ -559,8 +562,8 @@ app.post('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => 
 
   try {
     await query(
-      `INSERT INTO campaigns (id, user_id, name, type, status, contact_list_name, subject, body_template, sender_email, delay_seconds, send_limit, sender_emails, emails_per_hour_per_account, total_contacts)
-       VALUES ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      `INSERT INTO campaigns (id, user_id, name, type, status, contact_list_name, subject, body_template, sender_email, delay_seconds, send_limit, sender_emails, emails_per_hour_per_account, total_contacts, reply_to, sender_name)
+       VALUES ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         id, userId, campaignData.name, campaignData.type,
         campaignData.contactListName, campaignData.subject, campaignData.bodyTemplate,
@@ -568,7 +571,9 @@ app.post('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => 
         campaignData.sendLimit ? Number(campaignData.sendLimit) : null,
         JSON.stringify(campaignData.senderEmails || []),
         campaignData.emailsPerHourPerAccount ? Number(campaignData.emailsPerHourPerAccount) : null,
-        Number(campaignData.totalContacts || 0)
+        Number(campaignData.totalContacts || 0),
+        campaignData.replyTo || null,
+        campaignData.senderName || null
       ]
     );
 
@@ -593,7 +598,9 @@ app.post('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => 
       successCount: campaign.success_count,
       failedCount: campaign.failed_count,
       createdAt: campaign.created_at,
-      startedAt: campaign.started_at
+      startedAt: campaign.started_at,
+      replyTo: campaign.reply_to,
+      senderName: campaign.sender_name
     });
   } catch (err: any) {
     console.error('Error creating campaign:', err);
@@ -631,13 +638,16 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
     if (updates.bodyTemplate) await query('UPDATE campaigns SET body_template = $1 WHERE id = $2', [updates.bodyTemplate, id]);
     if (updates.delaySeconds !== undefined) await query('UPDATE campaigns SET delay_seconds = $1 WHERE id = $2', [Number(updates.delaySeconds), id]);
     if (updates.emailsPerHourPerAccount !== undefined) await query('UPDATE campaigns SET emails_per_hour_per_account = $1 WHERE id = $2', [Number(updates.emailsPerHourPerAccount), id]);
+    if (updates.replyTo !== undefined) await query('UPDATE campaigns SET reply_to = $1 WHERE id = $2', [updates.replyTo || null, id]);
+    if (updates.senderName !== undefined) await query('UPDATE campaigns SET sender_name = $1 WHERE id = $2', [updates.senderName || null, id]);
 
     const updated = await query(
       `SELECT id, name, type, status, contact_list_name as "contactListName", subject, body_template as "bodyTemplate",
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt"
+       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
+       reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE id = $1`, [id]
     );
 
@@ -1069,7 +1079,7 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
 // Global token cache
 const googleTokensCache: Record<string, { token: string; expiresAt: number }> = {};
 
-async function sendGmailApi(userId: number, senderEmail: string, recipientEmail: string, recipientName: string, subject: string, htmlBody: string) {
+async function sendGmailApi(userId: number, senderEmail: string, recipientEmail: string, recipientName: string, subject: string, htmlBody: string, senderName?: string, replyTo?: string) {
   // Find sender credentials (user-scoped)
   const accountResult = await query(
     'SELECT * FROM accounts WHERE user_id = $1 AND LOWER(email) = LOWER($2)',
@@ -1106,7 +1116,7 @@ async function sendGmailApi(userId: number, senderEmail: string, recipientEmail:
     }
   }
 
-  const rawBase64 = constructRawEmail(recipientEmail, 'Equinox Mail', senderEmail, subject, htmlBody);
+  const rawBase64 = constructRawEmail(recipientEmail, senderName || '', senderEmail, subject, htmlBody, replyTo);
 
   const sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method: 'POST',
@@ -1151,7 +1161,7 @@ async function executeEmailDispatchTick() {
         await query("UPDATE email_queue SET status = 'sending' WHERE id = $1", [item.id]);
 
         try {
-          await sendGmailApi(campaign.user_id, item.sender_email, item.recipient_email, item.recipient_name, item.subject, item.body);
+          await sendGmailApi(campaign.user_id, item.sender_email, item.recipient_email, item.recipient_name, item.subject, item.body, campaign.sender_name || undefined, campaign.reply_to || undefined);
 
           await query("UPDATE email_queue SET status = 'success' WHERE id = $1", [item.id]);
           await query(
