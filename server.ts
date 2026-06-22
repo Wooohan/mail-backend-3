@@ -48,8 +48,8 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // Apply IP restriction check globally
 app.use(checkIpRestriction as any);
@@ -451,7 +451,7 @@ app.get('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   }
 });
 
-// POST Contacts (user-scoped)
+// POST Contacts (user-scoped) - batch insert for large lists
 app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   const newContacts = req.body;
   const userId = req.user!.id;
@@ -459,16 +459,39 @@ app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   try {
     const contactsArray = Array.isArray(newContacts) ? newContacts : [newContacts];
 
-    for (const c of contactsArray) {
-      const id = c.id || Math.random().toString(36).substr(2, 9);
+    // Batch insert in chunks of 500 for performance
+    const BATCH_SIZE = 500;
+    for (let i = 0; i < contactsArray.length; i += BATCH_SIZE) {
+      const batch = contactsArray.slice(i, i + BATCH_SIZE);
+
+      // Build a multi-row INSERT with unnest for efficiency
+      const ids: string[] = [];
+      const emails: string[] = [];
+      const names: string[] = [];
+      const listNames: string[] = [];
+      const companies: string[] = [];
+      const firstNames: string[] = [];
+      const variables: string[] = [];
+
+      for (const c of batch) {
+        ids.push(c.id || Math.random().toString(36).substr(2, 9));
+        emails.push((c.email || '').trim());
+        names.push((c.name || '').trim());
+        listNames.push((c.listName || 'Unassigned').trim());
+        companies.push(c.company || '');
+        firstNames.push(c.firstName || '');
+        variables.push(JSON.stringify(c.variables || {}));
+      }
+
       await query(
-        `INSERT INTO contacts (id, user_id, email, name, list_name, company, first_name, variables) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (id) DO UPDATE SET email = $3, name = $4, list_name = $5, company = $6, first_name = $7, variables = $8`,
-        [id, userId, (c.email || '').trim(), (c.name || '').trim(), (c.listName || 'Unassigned').trim(), c.company || '', c.firstName || '', JSON.stringify(c.variables || {})]
+        `INSERT INTO contacts (id, user_id, email, name, list_name, company, first_name, variables)
+         SELECT unnest($1::text[]), $2, unnest($3::text[]), unnest($4::text[]), unnest($5::text[]), unnest($6::text[]), unnest($7::text[]), unnest($8::jsonb[])
+         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, list_name = EXCLUDED.list_name, company = EXCLUDED.company, first_name = EXCLUDED.first_name, variables = EXCLUDED.variables`,
+        [ids, userId, emails, names, listNames, companies, firstNames, variables]
       );
     }
 
-    res.json({ success: true });
+    res.json({ success: true, count: contactsArray.length });
   } catch (err: any) {
     console.error('Error saving contacts:', err);
     res.status(500).json({ error: 'Failed to save contacts.' });
