@@ -438,16 +438,59 @@ app.delete('/api/accounts/:email', requireAuth as any, async (req: AuthRequest, 
   }
 });
 
-// GET Contacts (user-scoped)
+// GET Contacts (user-scoped) — supports server-side pagination
 app.get('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   try {
+    const userId = req.user!.id;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit as string) || 500));
+    const listName = req.query.listName as string | undefined;
+    const offset = (page - 1) * limit;
+
+    // Build WHERE clause
+    let whereSql = 'WHERE user_id = $1';
+    const params: any[] = [userId];
+    let paramIdx = 2;
+
+    if (listName) {
+      whereSql += ` AND LOWER(list_name) = LOWER($${paramIdx})`;
+      params.push(listName);
+      paramIdx++;
+    }
+
+    // Get total count
+    const countResult = await query(`SELECT COUNT(*) as total FROM contacts ${whereSql}`, params);
+    const total = parseInt(countResult.rows[0].total);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+
+    // Get paginated results
     const result = await query(
-      'SELECT id, email, name, list_name as "listName", company, first_name as "firstName", variables, created_at as "createdAt" FROM contacts WHERE user_id = $1 ORDER BY created_at DESC',
-      [req.user!.id]
+      `SELECT id, email, name, list_name as "listName", company, first_name as "firstName", variables, created_at as "createdAt" FROM contacts ${whereSql} ORDER BY created_at DESC LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+      [...params, limit, offset]
     );
-    res.json(result.rows);
+
+    res.json({
+      contacts: result.rows,
+      total,
+      page,
+      totalPages,
+      limit
+    });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to fetch contacts.' });
+  }
+});
+
+// GET Contact Lists summary (user-scoped) — lightweight, returns list names + counts only
+app.get('/api/contacts/lists', requireAuth as any, async (req: AuthRequest, res) => {
+  try {
+    const result = await query(
+      'SELECT list_name as "listName", COUNT(*) as count FROM contacts WHERE user_id = $1 GROUP BY list_name ORDER BY list_name',
+      [req.user!.id]
+    );
+    res.json(result.rows.map(r => ({ listName: r.listName || 'Unassigned', count: parseInt(r.count) })));
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch contact lists.' });
   }
 });
 
