@@ -16,9 +16,10 @@ if (process.env.DATABASE_URL) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
-    max: 20,
+    max: 30,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
+    connectionTimeoutMillis: 10000,
+    statement_timeout: 60000,
   });
 
   pool.on('error', (err) => {
