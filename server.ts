@@ -752,13 +752,13 @@ app.delete('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, re
   }
 });
 
-// GET Campaign Logs (user-scoped)
+// GET Campaign Logs (user-scoped) — limited to 50 latest entries
 app.get('/api/campaigns/:id/logs', requireAuth as any, async (req: AuthRequest, res) => {
   const { id } = req.params;
   try {
     const result = await query(
       `SELECT id, campaign_id as "campaignId", timestamp, recipient, sender, status, subject, error_message as "errorMessage"
-       FROM campaign_logs WHERE campaign_id = $1 AND user_id = $2 ORDER BY timestamp DESC`,
+       FROM campaign_logs WHERE campaign_id = $1 AND user_id = $2 ORDER BY timestamp DESC LIMIT 50`,
       [id, req.user!.id]
     );
     res.json(result.rows);
