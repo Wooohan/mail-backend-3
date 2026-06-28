@@ -96,18 +96,46 @@ export function requireAdmin(req: AuthRequest, res: Response, next: NextFunction
 }
 
 /**
+ * In-memory cache for IP restriction checks to avoid hitting DB on every request.
+ * Cache entries expire after 60 seconds.
+ */
+const ipRestrictionCache: Map<string, { restricted: boolean; expiresAt: number }> = new Map();
+const IP_CACHE_TTL_MS = 60_000; // 60 seconds
+
+/**
  * Middleware: Check if user IP is restricted
+ * Skips OPTIONS (preflight) requests entirely for performance.
+ * Uses in-memory cache to avoid DB round-trip on every request.
  */
 export async function checkIpRestriction(req: AuthRequest, res: Response, next: NextFunction) {
+  // Never block preflight requests — they must return fast for CORS to work
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+
   const ip = getClientIp(req);
   
+  // Check cache first
+  const cached = ipRestrictionCache.get(ip);
+  if (cached && cached.expiresAt > Date.now()) {
+    if (cached.restricted) {
+      return res.status(403).json({ error: 'Access denied. Your IP has been restricted.' });
+    }
+    return next();
+  }
+
   try {
     const result = await query(
       `SELECT id FROM admin_restrictions WHERE type = 'ip_ban' AND value = $1 AND is_active = true`,
       [ip]
     );
     
-    if (result.rows.length > 0) {
+    const isRestricted = result.rows.length > 0;
+    
+    // Cache the result
+    ipRestrictionCache.set(ip, { restricted: isRestricted, expiresAt: Date.now() + IP_CACHE_TTL_MS });
+    
+    if (isRestricted) {
       return res.status(403).json({ error: 'Access denied. Your IP has been restricted.' });
     }
     
