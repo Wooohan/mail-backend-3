@@ -42,7 +42,10 @@ app.use((req, res, next) => {
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  // Cache preflight responses for 1 hour — browsers won't re-send OPTIONS for cached routes
+  res.setHeader('Access-Control-Max-Age', '3600');
   if (req.method === 'OPTIONS') {
+    // Return immediately for preflight — no middleware chain needed
     return res.sendStatus(204);
   }
   next();
