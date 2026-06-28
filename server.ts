@@ -48,8 +48,8 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // Apply IP restriction check globally
 app.use(checkIpRestriction as any);
@@ -67,7 +67,7 @@ const getRedirectUri = (req: any) => {
 };
 
 // Custom helper: RFC 2822 email encoder
-const constructRawEmail = (to: string, fromName: string, fromEmail: string, subject: string, body: string) => {
+const constructRawEmail = (to: string, fromName: string, fromEmail: string, subject: string, body: string, replyTo?: string) => {
   const fromHeader = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
   const emailLines = [
     `From: ${fromHeader}`,
@@ -76,9 +76,11 @@ const constructRawEmail = (to: string, fromName: string, fromEmail: string, subj
     'MIME-Version: 1.0',
     'Content-Type: text/html; charset=utf-8',
     'Content-Transfer-Encoding: 7bit',
-    '',
-    body
   ];
+  if (replyTo) {
+    emailLines.splice(2, 0, `Reply-To: <${replyTo}>`);
+  }
+  emailLines.push('', body);
   const rawEmail = emailLines.join('\r\n');
   return Buffer.from(rawEmail)
     .toString('base64')
@@ -265,7 +267,8 @@ app.post('/api/auth/change-password', requireAuth as any, async (req: AuthReques
    ========================================================================== */
 
 // 1. OAuth Initiate - now requires auth, stores user_id in state
-app.get('/api/oauth/url', requireAuth as any, (req: AuthRequest, res) => {
+// Support both /api/auth/url (legacy) and /api/oauth/url (new)
+app.get(['/api/auth/url', '/api/oauth/url'], requireAuth as any, (req: AuthRequest, res) => {
   const redirectUri = getRedirectUri(req);
   const scopes = [
     'https://www.googleapis.com/auth/gmail.send',
@@ -435,20 +438,63 @@ app.delete('/api/accounts/:email', requireAuth as any, async (req: AuthRequest, 
   }
 });
 
-// GET Contacts (user-scoped)
+// GET Contacts (user-scoped) — supports server-side pagination
 app.get('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   try {
+    const userId = req.user!.id;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit as string) || 500));
+    const listName = req.query.listName as string | undefined;
+    const offset = (page - 1) * limit;
+
+    // Build WHERE clause
+    let whereSql = 'WHERE user_id = $1';
+    const params: any[] = [userId];
+    let paramIdx = 2;
+
+    if (listName) {
+      whereSql += ` AND LOWER(list_name) = LOWER($${paramIdx})`;
+      params.push(listName);
+      paramIdx++;
+    }
+
+    // Get total count
+    const countResult = await query(`SELECT COUNT(*) as total FROM contacts ${whereSql}`, params);
+    const total = parseInt(countResult.rows[0].total);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+
+    // Get paginated results
     const result = await query(
-      'SELECT id, email, name, list_name as "listName", company, first_name as "firstName", variables, created_at as "createdAt" FROM contacts WHERE user_id = $1 ORDER BY created_at DESC',
-      [req.user!.id]
+      `SELECT id, email, name, list_name as "listName", company, first_name as "firstName", variables, created_at as "createdAt" FROM contacts ${whereSql} ORDER BY created_at DESC LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
+      [...params, limit, offset]
     );
-    res.json(result.rows);
+
+    res.json({
+      contacts: result.rows,
+      total,
+      page,
+      totalPages,
+      limit
+    });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to fetch contacts.' });
   }
 });
 
-// POST Contacts (user-scoped)
+// GET Contact Lists summary (user-scoped) — lightweight, returns list names + counts only
+app.get('/api/contacts/lists', requireAuth as any, async (req: AuthRequest, res) => {
+  try {
+    const result = await query(
+      'SELECT list_name as "listName", COUNT(*) as count FROM contacts WHERE user_id = $1 GROUP BY list_name ORDER BY list_name',
+      [req.user!.id]
+    );
+    res.json(result.rows.map(r => ({ listName: r.listName || 'Unassigned', count: parseInt(r.count) })));
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch contact lists.' });
+  }
+});
+
+// POST Contacts (user-scoped) - batch insert for large lists
 app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   const newContacts = req.body;
   const userId = req.user!.id;
@@ -456,16 +502,51 @@ app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   try {
     const contactsArray = Array.isArray(newContacts) ? newContacts : [newContacts];
 
-    for (const c of contactsArray) {
-      const id = c.id || Math.random().toString(36).substr(2, 9);
-      await query(
-        `INSERT INTO contacts (id, user_id, email, name, list_name, company, first_name, variables) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (id) DO UPDATE SET email = $3, name = $4, list_name = $5, company = $6, first_name = $7, variables = $8`,
-        [id, userId, (c.email || '').trim(), (c.name || '').trim(), (c.listName || 'Unassigned').trim(), c.company || '', c.firstName || '', JSON.stringify(c.variables || {})]
-      );
+    // Batch insert in chunks of 2000 for performance (larger batches = fewer round-trips)
+    const BATCH_SIZE = 2000;
+    
+    // Process batches concurrently in groups of 3 to maximize throughput
+    // while not overwhelming the connection pool
+    const CONCURRENCY = 3;
+    const batches: any[][] = [];
+    for (let i = 0; i < contactsArray.length; i += BATCH_SIZE) {
+      batches.push(contactsArray.slice(i, i + BATCH_SIZE));
     }
 
-    res.json({ success: true });
+    const processBatch = async (batch: any[]) => {
+      const ids: string[] = [];
+      const emails: string[] = [];
+      const names: string[] = [];
+      const listNames: string[] = [];
+      const companies: string[] = [];
+      const firstNames: string[] = [];
+      const variables: string[] = [];
+
+      for (const c of batch) {
+        ids.push(c.id || Math.random().toString(36).substr(2, 9));
+        emails.push((c.email || '').trim());
+        names.push((c.name || '').trim());
+        listNames.push((c.listName || 'Unassigned').trim());
+        companies.push(c.company || '');
+        firstNames.push(c.firstName || '');
+        variables.push(JSON.stringify(c.variables || {}));
+      }
+
+      await query(
+        `INSERT INTO contacts (id, user_id, email, name, list_name, company, first_name, variables)
+         SELECT unnest($1::text[]), $2, unnest($3::text[]), unnest($4::text[]), unnest($5::text[]), unnest($6::text[]), unnest($7::text[]), unnest($8::jsonb[])
+         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, list_name = EXCLUDED.list_name, company = EXCLUDED.company, first_name = EXCLUDED.first_name, variables = EXCLUDED.variables`,
+        [ids, userId, emails, names, listNames, companies, firstNames, variables]
+      );
+    };
+
+    // Process batches with controlled concurrency
+    for (let i = 0; i < batches.length; i += CONCURRENCY) {
+      const concurrentBatches = batches.slice(i, i + CONCURRENCY);
+      await Promise.all(concurrentBatches.map(processBatch));
+    }
+
+    res.json({ success: true, count: contactsArray.length });
   } catch (err: any) {
     console.error('Error saving contacts:', err);
     res.status(500).json({ error: 'Failed to save contacts.' });
@@ -540,7 +621,8 @@ app.get('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => {
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt"
+       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
+       reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.user!.id]
     );
@@ -558,8 +640,8 @@ app.post('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => 
 
   try {
     await query(
-      `INSERT INTO campaigns (id, user_id, name, type, status, contact_list_name, subject, body_template, sender_email, delay_seconds, send_limit, sender_emails, emails_per_hour_per_account, total_contacts)
-       VALUES ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      `INSERT INTO campaigns (id, user_id, name, type, status, contact_list_name, subject, body_template, sender_email, delay_seconds, send_limit, sender_emails, emails_per_hour_per_account, total_contacts, reply_to, sender_name)
+       VALUES ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         id, userId, campaignData.name, campaignData.type,
         campaignData.contactListName, campaignData.subject, campaignData.bodyTemplate,
@@ -567,7 +649,9 @@ app.post('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => 
         campaignData.sendLimit ? Number(campaignData.sendLimit) : null,
         JSON.stringify(campaignData.senderEmails || []),
         campaignData.emailsPerHourPerAccount ? Number(campaignData.emailsPerHourPerAccount) : null,
-        Number(campaignData.totalContacts || 0)
+        Number(campaignData.totalContacts || 0),
+        campaignData.replyTo || null,
+        campaignData.senderName || null
       ]
     );
 
@@ -592,7 +676,9 @@ app.post('/api/campaigns', requireAuth as any, async (req: AuthRequest, res) => 
       successCount: campaign.success_count,
       failedCount: campaign.failed_count,
       createdAt: campaign.created_at,
-      startedAt: campaign.started_at
+      startedAt: campaign.started_at,
+      replyTo: campaign.reply_to,
+      senderName: campaign.sender_name
     });
   } catch (err: any) {
     console.error('Error creating campaign:', err);
@@ -630,13 +716,16 @@ app.put('/api/campaigns/:id', requireAuth as any, async (req: AuthRequest, res) 
     if (updates.bodyTemplate) await query('UPDATE campaigns SET body_template = $1 WHERE id = $2', [updates.bodyTemplate, id]);
     if (updates.delaySeconds !== undefined) await query('UPDATE campaigns SET delay_seconds = $1 WHERE id = $2', [Number(updates.delaySeconds), id]);
     if (updates.emailsPerHourPerAccount !== undefined) await query('UPDATE campaigns SET emails_per_hour_per_account = $1 WHERE id = $2', [Number(updates.emailsPerHourPerAccount), id]);
+    if (updates.replyTo !== undefined) await query('UPDATE campaigns SET reply_to = $1 WHERE id = $2', [updates.replyTo || null, id]);
+    if (updates.senderName !== undefined) await query('UPDATE campaigns SET sender_name = $1 WHERE id = $2', [updates.senderName || null, id]);
 
     const updated = await query(
       `SELECT id, name, type, status, contact_list_name as "contactListName", subject, body_template as "bodyTemplate",
        sender_email as "senderEmail", delay_seconds as "delaySeconds", send_limit as "sendLimit",
        sender_emails as "senderEmails", emails_per_hour_per_account as "emailsPerHourPerAccount",
        total_contacts as "totalContacts", sent_count as "sentCount", success_count as "successCount",
-       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt"
+       failed_count as "failedCount", created_at as "createdAt", started_at as "startedAt",
+       reply_to as "replyTo", sender_name as "senderName"
        FROM campaigns WHERE id = $1`, [id]
     );
 
@@ -995,19 +1084,19 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
     return;
   }
 
-  // Find contacts for this campaign
-  const contacts = await query(
-    'SELECT * FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2)',
+  // Find contacts for this campaign — use cursor-style pagination to avoid loading all into memory
+  const countResult = await query(
+    'SELECT COUNT(*) as total FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2)',
     [userId, campaign.contact_list_name]
   );
+  const totalAvailable = parseInt(countResult.rows[0].total);
 
-  if (contacts.rows.length === 0) return;
+  if (totalAvailable === 0) return;
 
-  let limit = contacts.rows.length;
+  let limit = totalAvailable;
   if (campaign.type === 'normal' && campaign.send_limit) {
     limit = Math.min(limit, campaign.send_limit);
   }
-  const slicedContacts = contacts.rows.slice(0, limit);
 
   let intervalMs = (campaign.delay_seconds || 5) * 1000;
   const now = Date.now();
@@ -1019,56 +1108,94 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
     intervalMs = Math.max(1, Math.round((3600 / (ratePerHourPerAcct * activeSendersNum)) * 1000));
   }
 
-  for (let idx = 0; idx < slicedContacts.length; idx++) {
-    const contact = slicedContacts[idx];
-    let senderEmail = '';
+  // Process contacts in batches of 1000 to avoid memory issues with 50K+ contacts
+  const QUEUE_BATCH_SIZE = 1000;
+  let globalIdx = 0;
+  let offset = 0;
 
-    if (campaign.type === 'normal') {
-      senderEmail = campaign.sender_email || '';
-    } else {
-      const senders = campaign.sender_emails || [];
-      if (senders.length > 0) {
-        senderEmail = senders[idx % senders.length];
+  while (globalIdx < limit) {
+    const batchLimit = Math.min(QUEUE_BATCH_SIZE, limit - globalIdx);
+    const contactsBatch = await query(
+      'SELECT * FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2) ORDER BY created_at ASC LIMIT $3 OFFSET $4',
+      [userId, campaign.contact_list_name, batchLimit, offset]
+    );
+
+    if (contactsBatch.rows.length === 0) break;
+
+    // Build batch insert arrays
+    const ids: string[] = [];
+    const userIds: number[] = [];
+    const campaignIds: string[] = [];
+    const recipientEmails: string[] = [];
+    const recipientNames: string[] = [];
+    const senderEmails: string[] = [];
+    const subjects: string[] = [];
+    const bodies: string[] = [];
+    const delayUntils: number[] = [];
+
+    for (const contact of contactsBatch.rows) {
+      let senderEmail = '';
+      if (campaign.type === 'normal') {
+        senderEmail = campaign.sender_email || '';
+      } else {
+        const senders = campaign.sender_emails || [];
+        if (senders.length > 0) {
+          senderEmail = senders[globalIdx % senders.length];
+        }
       }
+
+      // Template substitution
+      let personalizedBody = campaign.body_template || '';
+      let personalizedSubject = campaign.subject || '';
+
+      const performReplace = (key: string, value: string) => {
+        const regex = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'gi');
+        personalizedBody = personalizedBody.replace(regex, value);
+        personalizedSubject = personalizedSubject.replace(regex, value);
+      };
+
+      performReplace('name', contact.name || 'Subscriber');
+      performReplace('email', contact.email);
+      performReplace('firstName', contact.first_name || (contact.name ? contact.name.split(' ')[0] : '') || 'Subscriber');
+      performReplace('company', contact.company || 'your company');
+
+      if (contact.variables && typeof contact.variables === 'object') {
+        Object.entries(contact.variables).forEach(([k, v]) => {
+          performReplace(k, String(v || ''));
+        });
+      }
+
+      ids.push(Math.random().toString(36).substr(2, 9));
+      userIds.push(userId);
+      campaignIds.push(campaign.id);
+      recipientEmails.push(contact.email);
+      recipientNames.push(contact.name || '');
+      senderEmails.push(senderEmail);
+      subjects.push(personalizedSubject);
+      bodies.push(personalizedBody);
+      delayUntils.push(now + (globalIdx * intervalMs));
+
+      globalIdx++;
     }
 
-    // Template substitution
-    let personalizedBody = campaign.body_template || '';
-    let personalizedSubject = campaign.subject || '';
-
-    const performReplace = (key: string, value: string) => {
-      const regex = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'gi');
-      personalizedBody = personalizedBody.replace(regex, value);
-      personalizedSubject = personalizedSubject.replace(regex, value);
-    };
-
-    performReplace('name', contact.name || 'Subscriber');
-    performReplace('email', contact.email);
-    performReplace('firstName', contact.first_name || (contact.name ? contact.name.split(' ')[0] : '') || 'Subscriber');
-    performReplace('company', contact.company || 'your company');
-
-    if (contact.variables && typeof contact.variables === 'object') {
-      Object.entries(contact.variables).forEach(([k, v]) => {
-        performReplace(k, String(v || ''));
-      });
-    }
-
-    const queueId = Math.random().toString(36).substr(2, 9);
+    // Batch insert using unnest for efficiency
     await query(
       `INSERT INTO email_queue (id, user_id, campaign_id, recipient_email, recipient_name, sender_email, status, subject, body, delay_until)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)`,
-      [queueId, userId, campaign.id, contact.email, contact.name, senderEmail, personalizedSubject, personalizedBody, now + (idx * intervalMs)]
+       SELECT unnest($1::text[]), unnest($2::int[]), unnest($3::text[]), unnest($4::text[]), unnest($5::text[]), unnest($6::text[]), 'pending', unnest($7::text[]), unnest($8::text[]), unnest($9::bigint[])`,
+      [ids, userIds, campaignIds, recipientEmails, recipientNames, senderEmails, subjects, bodies, delayUntils]
     );
+
+    offset += contactsBatch.rows.length;
   }
 
   // Update total contacts
-  await query('UPDATE campaigns SET total_contacts = $1, sent_count = 0, success_count = 0, failed_count = 0 WHERE id = $2', [slicedContacts.length, campaign.id]);
+  await query('UPDATE campaigns SET total_contacts = $1, sent_count = 0, success_count = 0, failed_count = 0 WHERE id = $2', [globalIdx, campaign.id]);
 }
 
 // Global token cache
 const googleTokensCache: Record<string, { token: string; expiresAt: number }> = {};
 
-async function sendGmailApi(userId: number, senderEmail: string, recipientEmail: string, recipientName: string, subject: string, htmlBody: string) {
+async function sendGmailApi(userId: number, senderEmail: string, recipientEmail: string, recipientName: string, subject: string, htmlBody: string, senderName?: string, replyTo?: string) {
   // Find sender credentials (user-scoped)
   const accountResult = await query(
     'SELECT * FROM accounts WHERE user_id = $1 AND LOWER(email) = LOWER($2)',
@@ -1105,7 +1232,7 @@ async function sendGmailApi(userId: number, senderEmail: string, recipientEmail:
     }
   }
 
-  const rawBase64 = constructRawEmail(recipientEmail, 'Equinox Mail', senderEmail, subject, htmlBody);
+  const rawBase64 = constructRawEmail(recipientEmail, senderName || '', senderEmail, subject, htmlBody, replyTo);
 
   const sendRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
     method: 'POST',
@@ -1150,7 +1277,7 @@ async function executeEmailDispatchTick() {
         await query("UPDATE email_queue SET status = 'sending' WHERE id = $1", [item.id]);
 
         try {
-          await sendGmailApi(campaign.user_id, item.sender_email, item.recipient_email, item.recipient_name, item.subject, item.body);
+          await sendGmailApi(campaign.user_id, item.sender_email, item.recipient_email, item.recipient_name, item.subject, item.body, campaign.sender_name || undefined, campaign.reply_to || undefined);
 
           await query("UPDATE email_queue SET status = 'success' WHERE id = $1", [item.id]);
           await query(
