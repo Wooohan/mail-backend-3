@@ -502,12 +502,18 @@ app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
   try {
     const contactsArray = Array.isArray(newContacts) ? newContacts : [newContacts];
 
-    // Batch insert in chunks of 500 for performance
-    const BATCH_SIZE = 500;
+    // Batch insert in chunks of 2000 for performance (larger batches = fewer round-trips)
+    const BATCH_SIZE = 2000;
+    
+    // Process batches concurrently in groups of 3 to maximize throughput
+    // while not overwhelming the connection pool
+    const CONCURRENCY = 3;
+    const batches: any[][] = [];
     for (let i = 0; i < contactsArray.length; i += BATCH_SIZE) {
-      const batch = contactsArray.slice(i, i + BATCH_SIZE);
+      batches.push(contactsArray.slice(i, i + BATCH_SIZE));
+    }
 
-      // Build a multi-row INSERT with unnest for efficiency
+    const processBatch = async (batch: any[]) => {
       const ids: string[] = [];
       const emails: string[] = [];
       const names: string[] = [];
@@ -532,6 +538,12 @@ app.post('/api/contacts', requireAuth as any, async (req: AuthRequest, res) => {
          ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, list_name = EXCLUDED.list_name, company = EXCLUDED.company, first_name = EXCLUDED.first_name, variables = EXCLUDED.variables`,
         [ids, userId, emails, names, listNames, companies, firstNames, variables]
       );
+    };
+
+    // Process batches with controlled concurrency
+    for (let i = 0; i < batches.length; i += CONCURRENCY) {
+      const concurrentBatches = batches.slice(i, i + CONCURRENCY);
+      await Promise.all(concurrentBatches.map(processBatch));
     }
 
     res.json({ success: true, count: contactsArray.length });
@@ -1072,19 +1084,19 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
     return;
   }
 
-  // Find contacts for this campaign
-  const contacts = await query(
-    'SELECT * FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2)',
+  // Find contacts for this campaign — use cursor-style pagination to avoid loading all into memory
+  const countResult = await query(
+    'SELECT COUNT(*) as total FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2)',
     [userId, campaign.contact_list_name]
   );
+  const totalAvailable = parseInt(countResult.rows[0].total);
 
-  if (contacts.rows.length === 0) return;
+  if (totalAvailable === 0) return;
 
-  let limit = contacts.rows.length;
+  let limit = totalAvailable;
   if (campaign.type === 'normal' && campaign.send_limit) {
     limit = Math.min(limit, campaign.send_limit);
   }
-  const slicedContacts = contacts.rows.slice(0, limit);
 
   let intervalMs = (campaign.delay_seconds || 5) * 1000;
   const now = Date.now();
@@ -1096,50 +1108,88 @@ async function initializeCampaignQueue(campaign: any, userId: number) {
     intervalMs = Math.max(1, Math.round((3600 / (ratePerHourPerAcct * activeSendersNum)) * 1000));
   }
 
-  for (let idx = 0; idx < slicedContacts.length; idx++) {
-    const contact = slicedContacts[idx];
-    let senderEmail = '';
+  // Process contacts in batches of 1000 to avoid memory issues with 50K+ contacts
+  const QUEUE_BATCH_SIZE = 1000;
+  let globalIdx = 0;
+  let offset = 0;
 
-    if (campaign.type === 'normal') {
-      senderEmail = campaign.sender_email || '';
-    } else {
-      const senders = campaign.sender_emails || [];
-      if (senders.length > 0) {
-        senderEmail = senders[idx % senders.length];
+  while (globalIdx < limit) {
+    const batchLimit = Math.min(QUEUE_BATCH_SIZE, limit - globalIdx);
+    const contactsBatch = await query(
+      'SELECT * FROM contacts WHERE user_id = $1 AND LOWER(list_name) = LOWER($2) ORDER BY created_at ASC LIMIT $3 OFFSET $4',
+      [userId, campaign.contact_list_name, batchLimit, offset]
+    );
+
+    if (contactsBatch.rows.length === 0) break;
+
+    // Build batch insert arrays
+    const ids: string[] = [];
+    const userIds: number[] = [];
+    const campaignIds: string[] = [];
+    const recipientEmails: string[] = [];
+    const recipientNames: string[] = [];
+    const senderEmails: string[] = [];
+    const subjects: string[] = [];
+    const bodies: string[] = [];
+    const delayUntils: number[] = [];
+
+    for (const contact of contactsBatch.rows) {
+      let senderEmail = '';
+      if (campaign.type === 'normal') {
+        senderEmail = campaign.sender_email || '';
+      } else {
+        const senders = campaign.sender_emails || [];
+        if (senders.length > 0) {
+          senderEmail = senders[globalIdx % senders.length];
+        }
       }
+
+      // Template substitution
+      let personalizedBody = campaign.body_template || '';
+      let personalizedSubject = campaign.subject || '';
+
+      const performReplace = (key: string, value: string) => {
+        const regex = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'gi');
+        personalizedBody = personalizedBody.replace(regex, value);
+        personalizedSubject = personalizedSubject.replace(regex, value);
+      };
+
+      performReplace('name', contact.name || 'Subscriber');
+      performReplace('email', contact.email);
+      performReplace('firstName', contact.first_name || (contact.name ? contact.name.split(' ')[0] : '') || 'Subscriber');
+      performReplace('company', contact.company || 'your company');
+
+      if (contact.variables && typeof contact.variables === 'object') {
+        Object.entries(contact.variables).forEach(([k, v]) => {
+          performReplace(k, String(v || ''));
+        });
+      }
+
+      ids.push(Math.random().toString(36).substr(2, 9));
+      userIds.push(userId);
+      campaignIds.push(campaign.id);
+      recipientEmails.push(contact.email);
+      recipientNames.push(contact.name || '');
+      senderEmails.push(senderEmail);
+      subjects.push(personalizedSubject);
+      bodies.push(personalizedBody);
+      delayUntils.push(now + (globalIdx * intervalMs));
+
+      globalIdx++;
     }
 
-    // Template substitution
-    let personalizedBody = campaign.body_template || '';
-    let personalizedSubject = campaign.subject || '';
-
-    const performReplace = (key: string, value: string) => {
-      const regex = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'gi');
-      personalizedBody = personalizedBody.replace(regex, value);
-      personalizedSubject = personalizedSubject.replace(regex, value);
-    };
-
-    performReplace('name', contact.name || 'Subscriber');
-    performReplace('email', contact.email);
-    performReplace('firstName', contact.first_name || (contact.name ? contact.name.split(' ')[0] : '') || 'Subscriber');
-    performReplace('company', contact.company || 'your company');
-
-    if (contact.variables && typeof contact.variables === 'object') {
-      Object.entries(contact.variables).forEach(([k, v]) => {
-        performReplace(k, String(v || ''));
-      });
-    }
-
-    const queueId = Math.random().toString(36).substr(2, 9);
+    // Batch insert using unnest for efficiency
     await query(
       `INSERT INTO email_queue (id, user_id, campaign_id, recipient_email, recipient_name, sender_email, status, subject, body, delay_until)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9)`,
-      [queueId, userId, campaign.id, contact.email, contact.name, senderEmail, personalizedSubject, personalizedBody, now + (idx * intervalMs)]
+       SELECT unnest($1::text[]), unnest($2::int[]), unnest($3::text[]), unnest($4::text[]), unnest($5::text[]), unnest($6::text[]), 'pending', unnest($7::text[]), unnest($8::text[]), unnest($9::bigint[])`,
+      [ids, userIds, campaignIds, recipientEmails, recipientNames, senderEmails, subjects, bodies, delayUntils]
     );
+
+    offset += contactsBatch.rows.length;
   }
 
   // Update total contacts
-  await query('UPDATE campaigns SET total_contacts = $1, sent_count = 0, success_count = 0, failed_count = 0 WHERE id = $2', [slicedContacts.length, campaign.id]);
+  await query('UPDATE campaigns SET total_contacts = $1, sent_count = 0, success_count = 0, failed_count = 0 WHERE id = $2', [globalIdx, campaign.id]);
 }
 
 // Global token cache
