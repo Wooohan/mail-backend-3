@@ -133,11 +133,13 @@ CREATE TABLE IF NOT EXISTS admin_restrictions (
 CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id);
 CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
 CREATE INDEX IF NOT EXISTS idx_contacts_list_name ON contacts(user_id, list_name);
+CREATE INDEX IF NOT EXISTS idx_contacts_user_list_created ON contacts(user_id, list_name, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_campaigns_user_id ON campaigns(user_id);
 CREATE INDEX IF NOT EXISTS idx_campaign_logs_user_id ON campaign_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_campaign_logs_campaign_id ON campaign_logs(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_email_queue_campaign_id ON email_queue(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_email_queue_status ON email_queue(status);
+CREATE INDEX IF NOT EXISTS idx_email_queue_campaign_status_delay ON email_queue(campaign_id, status, delay_until);
 CREATE INDEX IF NOT EXISTS idx_login_history_user_id ON login_history(user_id);
 CREATE INDEX IF NOT EXISTS idx_admin_restrictions_type ON admin_restrictions(type);
 
